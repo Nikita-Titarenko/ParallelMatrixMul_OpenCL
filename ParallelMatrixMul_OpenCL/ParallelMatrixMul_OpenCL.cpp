@@ -1,63 +1,92 @@
-#include <CL/cl.hpp>
+﻿#include <CL/cl.hpp>
 #include <iostream>
 #include <vector>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <omp.h>
 
-#define N 2048
+#define N 1024
 #define BLOCK_SIZE 16
 
-void generateMatrix(std::vector<float>& mat) {
+using namespace std;
+
+void generateMatrix(vector<float>& mat) {
     for (auto& val : mat)
         val = static_cast<float>(rand() % 10);
 }
 
-void cpuMatMulTiled(const std::vector<float>& A, const std::vector<float>& B, std::vector<float>& C) {
-    std::fill(C.begin(), C.end(), 0.0f);
+void printResult(const string& name, double time_ms, double base) {
+    cout << name << ":\t" << time_ms << " ms";
+    if (base > 0)
+        cout << "\t(прискорення ×" << base / time_ms << ")";
+    cout << endl;
+}
+
+void multiplyMatrices1(const vector<float>& A, const vector<float>& B, vector<float>& C) {
+    fill(C.begin(), C.end(), 0.0f);
+    for (int i = 0; i < N; i++)
+        for (int j = 0; j < N; j++)
+            for (int k = 0; k < N; k++)
+                C[i * N + j] += A[i * N + k] * B[k * N + j];
+}
+
+void multiplyMatrices2(const vector<float>& A, const vector<float>& B, vector<float>& C) {
+    fill(C.begin(), C.end(), 0.0f);
+    for (int i = 0; i < N; i++)
+        for (int k = 0; k < N; k++) {
+            float a_ik = A[i * N + k];
+            for (int j = 0; j < N; j++)
+                C[i * N + j] += a_ik * B[k * N + j];
+        }
+}
+
+void multiplyMatrices3_omp(const vector<float>& A, const vector<float>& B, vector<float>& C) {
+    fill(C.begin(), C.end(), 0.0f);
+#pragma omp parallel for
+    for (int i = 0; i < N; i++)
+        for (int k = 0; k < N; k++) {
+            float a_ik = A[i * N + k];
+            for (int j = 0; j < N; j++)
+                C[i * N + j] += a_ik * B[k * N + j];
+        }
+}
+
+void cpuMatMulTiled(const vector<float>& A, const vector<float>& B, vector<float>& C) {
+    fill(C.begin(), C.end(), 0.0f);
     for (int ii = 0; ii < N; ii += BLOCK_SIZE)
         for (int jj = 0; jj < N; jj += BLOCK_SIZE)
             for (int kk = 0; kk < N; kk += BLOCK_SIZE)
-                for (int i = ii; i < std::min(ii + BLOCK_SIZE, N); i++)
-                    for (int k = kk; k < std::min(kk + BLOCK_SIZE, N); k++) {
+                for (int i = ii; i < min(ii + BLOCK_SIZE, N); i++)
+                    for (int k = kk; k < min(kk + BLOCK_SIZE, N); k++) {
                         float a_ik = A[i * N + k];
-                        for (int j = jj; j < std::min(jj + BLOCK_SIZE, N); j++)
+                        for (int j = jj; j < min(jj + BLOCK_SIZE, N); j++)
                             C[i * N + j] += a_ik * B[k * N + j];
                     }
 }
 
-int main() {
-    std::vector<float> A(N * N), B(N * N), C_cpu(N * N), C_gpu(N * N);
-    generateMatrix(A);
-    generateMatrix(B);
-
-    auto start_cpu = std::chrono::high_resolution_clock::now();
-    cpuMatMulTiled(A, B, C_cpu);
-    auto end_cpu = std::chrono::high_resolution_clock::now();
-    double cpu_time = std::chrono::duration<double, std::milli>(end_cpu - start_cpu).count();
-    std::cout << "CPU time (tiled): " << cpu_time << " ms\n";
-
+double gpuMatMulOpenCL(const vector<float>& A, const vector<float>& B, vector<float>& C) {
     try {
-        std::vector<cl::Platform> platforms;
+        vector<cl::Platform> platforms;
         cl::Platform::get(&platforms);
-        if (platforms.empty()) throw std::runtime_error("No OpenCL platforms found.");
+        if (platforms.empty()) throw runtime_error("OpenCL платформи не знайдено");
 
         cl::Platform platform = platforms[0];
-        std::vector<cl::Device> devices;
+        vector<cl::Device> devices;
         platform.getDevices(CL_DEVICE_TYPE_GPU, &devices);
-        if (devices.empty()) throw std::runtime_error("No GPU devices found.");
+        if (devices.empty()) throw runtime_error("GPU пристрої не знайдено");
 
         cl::Device device = devices[0];
-        std::cout << "Using GPU: " << device.getInfo<CL_DEVICE_NAME>() << "\n";
+        cout << "OpenCL пристрій: " << device.getInfo<CL_DEVICE_NAME>() << endl;
 
         cl::Context context(device);
         cl::CommandQueue queue(context, device);
 
-        cl::Buffer bufferA(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * A.size(), A.data());
-        cl::Buffer bufferB(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * B.size(), B.data());
-        cl::Buffer bufferC(context, CL_MEM_WRITE_ONLY, sizeof(float) * C_gpu.size());
+        cl::Buffer bufferA(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * A.size(), (void*)A.data());
+        cl::Buffer bufferB(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * B.size(), (void*)B.data());
+        cl::Buffer bufferC(context, CL_MEM_WRITE_ONLY, sizeof(float) * C.size());
 
-        std::string kernel_code = R"CLC(
+        string kernel_code = R"CLC(
         __kernel void matMulTiled(__global float* A,
                                   __global float* B,
                                   __global float* C,
@@ -87,7 +116,7 @@ int main() {
         }
         )CLC";
 
-        std::string define_block = "#define BLOCK_SIZE " + std::to_string(BLOCK_SIZE) + "\n";
+        string define_block = "#define BLOCK_SIZE " + to_string(BLOCK_SIZE) + "\n";
         kernel_code = define_block + kernel_code;
 
         cl::Program program(context, kernel_code);
@@ -102,34 +131,74 @@ int main() {
         cl::NDRange global(N, N);
         cl::NDRange local(BLOCK_SIZE, BLOCK_SIZE);
 
-        auto start_gpu = std::chrono::high_resolution_clock::now();
+        auto start_gpu = chrono::high_resolution_clock::now();
         queue.enqueueNDRangeKernel(kernel, cl::NullRange, global, local);
         queue.finish();
-        auto end_gpu = std::chrono::high_resolution_clock::now();
+        auto end_gpu = chrono::high_resolution_clock::now();
 
-        double gpu_time = std::chrono::duration<double, std::milli>(end_gpu - start_gpu).count();
-        std::cout << "GPU time (tiled): " << gpu_time << " ms\n";
+        queue.enqueueReadBuffer(bufferC, CL_TRUE, 0, sizeof(float) * C.size(), C.data());
 
-        queue.enqueueReadBuffer(bufferC, CL_TRUE, 0, sizeof(float) * C_gpu.size(), C_gpu.data());
+        double gpu_time = chrono::duration<double, milli>(end_gpu - start_gpu).count();
+        return gpu_time;
     }
     catch (const cl::Error& e) {
-        std::cerr << "OpenCL Error: " << e.what() << " (" << e.err() << ")\n";
-        return 1;
+        cerr << "OpenCL Error: " << e.what() << " (" << e.err() << ")" << endl;
+        return -1;
     }
-    catch (const std::exception& e) {
-        std::cerr << "Runtime Error: " << e.what() << "\n";
-        return 1;
+    catch (const exception& e) {
+        cerr << "Runtime Error: " << e.what() << endl;
+        return -1;
     }
+}
 
+int main() {
+    srand(0);
+
+    vector<float> A(N * N), B(N * N), C(N * N), tmp(N * N);
+    generateMatrix(A);
+    generateMatrix(B);
+
+    cout << "Порівняння методів множення матриць (" << N << "x" << N << ")\n";
+    cout << "------------------------------------------------------------\n";
+
+    double base_time = 0;
+
+    auto start = chrono::high_resolution_clock::now();
+    multiplyMatrices1(A, B, C);
+    auto end = chrono::high_resolution_clock::now();
+    base_time = chrono::duration<double, milli>(end - start).count();
+    printResult("1. Базовий (3 цикли)", base_time, 0);
+
+    start = chrono::high_resolution_clock::now();
+    multiplyMatrices2(A, B, tmp);
+    end = chrono::high_resolution_clock::now();
+    printResult("2. Оптимізований порядок", chrono::duration<double, milli>(end - start).count(), base_time);
+
+    start = chrono::high_resolution_clock::now();
+    multiplyMatrices3_omp(A, B, tmp);
+    end = chrono::high_resolution_clock::now();
+    printResult("3. OpenMP (CPU паралельно)", chrono::duration<double, milli>(end - start).count(), base_time);
+
+    start = chrono::high_resolution_clock::now();
+    cpuMatMulTiled(A, B, tmp);
+    end = chrono::high_resolution_clock::now();
+    printResult("4. Tiled CPU (блочний)", chrono::duration<double, milli>(end - start).count(), base_time);
+
+    double gpu_time = gpuMatMulOpenCL(A, B, tmp);
+    if (gpu_time > 0)
+        printResult("5. OpenCL (GPU)", gpu_time, base_time);
+
+    cout << "------------------------------------------------------------\n";
+    cout << "Перевірка коректності (випадкові елементи): ";
     bool correct = true;
     for (int i = 0; i < 1000; i++) {
         int idx = rand() % (N * N);
-        if (fabs(C_cpu[idx] - C_gpu[idx]) > 1e-2f) {
+        if (fabs(C[idx] - tmp[idx]) > 1e-2f) {
             correct = false;
             break;
         }
     }
-    std::cout << "Results are " << (correct ? "correct" : "incorrect") << std::endl;
+    cout << (correct ? "результати збігаються\n" : "відмінності знайдено\n");
 
     return 0;
 }
